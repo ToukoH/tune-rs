@@ -1,0 +1,10 @@
+[package]
+name = "tuners"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.15"
+rustfft = "6.0"
+clap = "4.0"
+anyhow = "1.0"
