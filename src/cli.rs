@@ -8,7 +8,7 @@ pub struct Config {
 pub fn parse_args() -> Config {
     let matches = Command::new("Guitar Tuner")
         .version("0.1")
-        .about("Command-line note tuner")
+        .about("Command-line tuner")
         .arg(
             Arg::new("sample_rate")
                 .short('r')
