@@ -6,81 +6,185 @@ mod tuner;
 
 use cli::parse_args;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use std::error::Error;
+use dsp::{PitchDetector, PitchState};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tuner::PitchSmoother;
 
-fn main() -> Result<(), Box<dyn Error>> {
-    graphics::init_terminal()?;
+enum UiEvent {
+    Ready(audio::AudioInfo),
+    Pitch(PitchState),
+    Error(String),
+}
 
+struct LastPitch {
+    note: String,
+    frequency: f32,
+    target_frequency: f32,
+    cents: f32,
+    confidence: f32,
+    at: Instant,
+}
+
+fn is_quit_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        || key.code == KeyCode::Char('q')
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn main() -> anyhow::Result<()> {
     let config = parse_args();
-    println!(
-        "Starting tuner with configured sample rate: {} and tolerance: {} cents",
-        config.sample_rate, config.tolerance
-    );
-    let cli_sample_rate = config.sample_rate;
+    let mut terminal = graphics::Terminal::new()?;
+    terminal.draw_starting()?;
 
     let running = Arc::new(AtomicBool::new(true));
-    let running_clone = running.clone();
+    let audio_running = Arc::clone(&running);
+    let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
+    let requested_sample_rate = config.sample_rate;
 
     let audio_handle = std::thread::spawn(move || {
-        if let Err(e) =
-            audio::start_audio_capture_with_callback(
-                move |data, sample_rate| {
-                    if data.is_empty() {
-                        return;
-                    }
-                    // Calculate RMS amplitude.
-                    let rms: f32 = (data.iter().map(|&x| x * x).sum::<f32>() / data.len() as f32)
-                        .sqrt();
-                    const RMS_THRESHOLD: f32 = 0.001;
-                    if rms < RMS_THRESHOLD {
-                        let _ = graphics::update_message("Signal too weak...");
-                        return;
-                    }
-                    let magnitudes = dsp::compute_fft(data);
-                    let (max_index, max_magnitude) = magnitudes
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                        .unwrap();
-                    const FFT_MAG_THRESHOLD: f32 = 0.001;
-                    if *max_magnitude < FFT_MAG_THRESHOLD {
-                        let _ = graphics::update_message("No convincing dominant frequency...");
-                        return;
-                    }
-                    let fft_size = data.len() as f32;
-                    let dominant_freq = (max_index as f32) * (sample_rate / fft_size);
-                    if let Some((note, cents)) = tuner::detect_note(dominant_freq) {
-                        let _ = graphics::update_tuning(&note, cents);
-                    } else {
-                        let _ = graphics::update_message("No valid note detected");
-                    }
-                },
-                cli_sample_rate,
-            ) {
-            eprintln!("Audio error: {}", e);
+        let ready_tx = ui_tx.clone();
+        let pitch_tx = ui_tx.clone();
+        let error_tx = ui_tx;
+        let mut detector = None;
+
+        let result = audio::run_audio_capture(
+            move |samples, sample_rate| {
+                let detector = detector.get_or_insert_with(|| PitchDetector::new(sample_rate));
+                if let Some(state) = detector.push(samples) {
+                    let _ = pitch_tx.send(UiEvent::Pitch(state));
+                }
+            },
+            move |info| {
+                let _ = ready_tx.send(UiEvent::Ready(info));
+            },
+            requested_sample_rate,
+            audio_running,
+        );
+
+        if let Err(error) = result {
+            let _ = error_tx.send(UiEvent::Error(error.to_string()));
         }
-        running_clone.store(false, Ordering::SeqCst);
     });
 
-    while running.load(Ordering::SeqCst) {
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(KeyEvent { code, modifiers, .. }) = event::read()? {
-                if (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL))
-                    || code == KeyCode::Esc
-                    || (code == KeyCode::Char('q'))
-                {
-                    running.store(false, Ordering::SeqCst);
+    let mut audio_info = None;
+    let mut smoother = PitchSmoother::new();
+    let mut fatal_error = None;
+    let mut last_pitch: Option<LastPitch> = None;
+
+    while running.load(Ordering::Acquire) {
+        loop {
+            let update = match ui_rx.try_recv() {
+                Ok(update) => update,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if running.load(Ordering::Acquire) {
+                        fatal_error = Some("audio worker stopped unexpectedly".to_string());
+                        running.store(false, Ordering::Release);
+                    }
+                    break;
+                }
+            };
+
+            match update {
+                UiEvent::Ready(info) => {
+                    audio_info = Some(info);
+                    terminal.draw_waiting("Listening for a string", audio_info.as_ref(), -120.0)?;
+                }
+                UiEvent::Pitch(PitchState::TooQuiet { level_db }) => {
+                    if let Some(previous) = last_pitch.as_ref() {
+                        if previous.at.elapsed() <= Duration::from_millis(650) {
+                            terminal.draw_pitch(
+                                &previous.note,
+                                previous.frequency,
+                                previous.target_frequency,
+                                previous.cents,
+                                previous.confidence * 0.8,
+                                config.tolerance,
+                                level_db,
+                                audio_info.as_ref(),
+                            )?;
+                            continue;
+                        }
+                    }
+                    smoother.reset();
+                    last_pitch = None;
+                    terminal.draw_waiting("Pluck a string", audio_info.as_ref(), level_db)?;
+                }
+                UiEvent::Pitch(PitchState::Uncertain { level_db }) => {
+                    if let Some(previous) = last_pitch.as_ref() {
+                        if previous.at.elapsed() <= Duration::from_millis(650) {
+                            terminal.draw_pitch(
+                                &previous.note,
+                                previous.frequency,
+                                previous.target_frequency,
+                                previous.cents,
+                                previous.confidence * 0.85,
+                                config.tolerance,
+                                level_db,
+                                audio_info.as_ref(),
+                            )?;
+                            continue;
+                        }
+                    }
+                    terminal.draw_waiting("Listening for a stable pitch", audio_info.as_ref(), level_db)?;
+                }
+                UiEvent::Pitch(PitchState::Pitch {
+                    frequency,
+                    confidence,
+                    level_db,
+                }) => {
+                    let frequency = smoother.update(frequency);
+                    if let Some(reading) = tuner::detect_note(frequency) {
+                        terminal.draw_pitch(
+                            &reading.name,
+                            frequency,
+                            reading.target_frequency,
+                            reading.cents,
+                            confidence,
+                            config.tolerance,
+                            level_db,
+                            audio_info.as_ref(),
+                        )?;
+                        last_pitch = Some(LastPitch {
+                            note: reading.name,
+                            frequency,
+                            target_frequency: reading.target_frequency,
+                            cents: reading.cents,
+                            confidence,
+                            at: Instant::now(),
+                        });
+                    }
+                }
+                UiEvent::Error(error) => {
+                    fatal_error = Some(error);
+                    running.store(false, Ordering::Release);
+                }
+            }
+        }
+
+        if event::poll(Duration::from_millis(20))? {
+            if let Event::Key(key) = event::read()? {
+                if is_quit_key(key) {
+                    running.store(false, Ordering::Release);
                 }
             }
         }
     }
 
-    audio_handle.join().unwrap();
+    running.store(false, Ordering::Release);
 
-    graphics::restore_terminal()?;
-    println!("Exiting...");
+    if audio_handle.join().is_err() && fatal_error.is_none() {
+        fatal_error = Some("audio worker panicked".to_string());
+    }
+
+    drop(terminal);
+
+    if let Some(error) = fatal_error {
+        return Err(anyhow::anyhow!(error));
+    }
+
     Ok(())
 }
